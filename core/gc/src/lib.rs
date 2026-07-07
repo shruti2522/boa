@@ -31,6 +31,9 @@ use std::{
     ptr::NonNull,
 };
 
+#[cfg(feature = "oscars_backend")]
+use oscars::alloc::mempool3::PoolAllocator;
+
 pub use crate::trace::{Finalize, Trace, Tracer};
 pub use boa_macros::{Finalize, Trace};
 pub use cell::{GcRef, GcRefCell, GcRefMut};
@@ -48,6 +51,10 @@ thread_local!(static BOA_GC: RefCell<BoaGc> = RefCell::new( BoaGc {
     strongs: Vec::default(),
     weaks: Vec::default(),
     weak_maps: Vec::default(),
+    #[cfg(feature = "oscars_backend")]
+    pool_alloc: PoolAllocator::default()
+        .with_page_size(65536)
+        .with_heap_threshold(1_048_576),
 }));
 
 #[derive(Debug, Clone, Copy)]
@@ -84,6 +91,8 @@ struct BoaGc {
     strongs: Vec<GcErasedPointer>,
     weaks: Vec<EphemeronPointer>,
     weak_maps: Vec<ErasedWeakMapBoxPointer>,
+    #[cfg(feature = "oscars_backend")]
+    pool_alloc: PoolAllocator<'static>,
 }
 
 impl Drop for BoaGc {
@@ -134,8 +143,24 @@ impl Allocator {
             let mut gc = st.borrow_mut();
 
             Self::manage_state(&mut gc);
-            // Safety: value cannot be a null pointer, since `Box` cannot return null pointers.
-            let ptr = unsafe { NonNull::new_unchecked(Box::into_raw(Box::new(value))) };
+
+            #[cfg(not(feature = "oscars_backend"))]
+            let ptr = {
+                // Safety: value cannot be a null pointer, since `Box` cannot return null pointers.
+                unsafe { NonNull::new_unchecked(Box::into_raw(Box::new(value))) }
+            };
+
+            #[cfg(feature = "oscars_backend")]
+            let ptr = {
+                let pool_ptr = gc
+                    .pool_alloc
+                    .try_alloc(value)
+                    .expect("PoolAllocator: failed to allocate GcBox");
+                // SAFETY: PoolItem<T> is #[repr(transparent)], so the pointer
+                // to PoolItem<GcBox<T>> has the same address as GcBox<T>.
+                unsafe { NonNull::new_unchecked(pool_ptr.as_ptr().as_ptr().cast::<GcBox<T>>()) }
+            };
+
             let erased: NonNull<GcBox<NonTraceable>> = ptr.cast();
 
             gc.strongs.push(erased);
@@ -153,8 +178,27 @@ impl Allocator {
             let mut gc = st.borrow_mut();
 
             Self::manage_state(&mut gc);
-            // Safety: value cannot be a null pointer, since `Box` cannot return null pointers.
-            let ptr = unsafe { NonNull::new_unchecked(Box::into_raw(Box::new(value))) };
+
+            #[cfg(not(feature = "oscars_backend"))]
+            let ptr = {
+                // Safety: value cannot be a null pointer, since `Box` cannot return null pointers.
+                unsafe { NonNull::new_unchecked(Box::into_raw(Box::new(value))) }
+            };
+
+            #[cfg(feature = "oscars_backend")]
+            let ptr = {
+                let pool_ptr = gc
+                    .pool_alloc
+                    .try_alloc(value)
+                    .expect("PoolAllocator: failed to allocate EphemeronBox");
+                // SAFETY: PoolItem<T> is #[repr(transparent)]
+                unsafe {
+                    NonNull::new_unchecked(
+                        pool_ptr.as_ptr().as_ptr().cast::<EphemeronBox<K, V>>(),
+                    )
+                }
+            };
+
             let erased: NonNull<dyn ErasedEphemeronBox> = ptr;
 
             gc.weaks.push(erased);
@@ -175,8 +219,24 @@ impl Allocator {
 
             let weak_box = WeakMapBox { map: weak };
 
-            // Safety: value cannot be a null pointer, since `Box` cannot return null pointers.
-            let ptr = unsafe { NonNull::new_unchecked(Box::into_raw(Box::new(weak_box))) };
+            #[cfg(not(feature = "oscars_backend"))]
+            let ptr = {
+                // Safety: value cannot be a null pointer, since `Box` cannot return null pointers.
+                unsafe { NonNull::new_unchecked(Box::into_raw(Box::new(weak_box))) }
+            };
+
+            #[cfg(feature = "oscars_backend")]
+            let ptr = {
+                let pool_ptr = gc
+                    .pool_alloc
+                    .try_alloc(weak_box)
+                    .expect("PoolAllocator: failed to allocate WeakMapBox");
+                // SAFETY: PoolItem<T> is #[repr(transparent)]
+                unsafe {
+                    NonNull::new_unchecked(pool_ptr.as_ptr().as_ptr().cast::<WeakMapBox<K, V>>())
+                }
+            };
+
             let erased: ErasedWeakMapBoxPointer = ptr;
 
             gc.weak_maps.push(erased);
@@ -250,6 +310,8 @@ impl Collector {
                 &mut gc.strongs,
                 &mut gc.weaks,
                 &mut gc.runtime.bytes_allocated,
+                #[cfg(feature = "oscars_backend")]
+                &mut gc.pool_alloc,
             );
         }
 
@@ -263,10 +325,19 @@ impl Collector {
 
                 true
             } else {
-                // SAFETY:
-                // The `Allocator` must always ensure its start node is a valid, non-null pointer that
-                // was allocated by `Box::from_raw(Box::new(..))`.
-                let _unmarked_node = unsafe { Box::from_raw(w.as_ptr()) };
+                #[cfg(not(feature = "oscars_backend"))]
+                {
+                    // SAFETY: allocated by Box::into_raw(Box::new(..)).
+                    let _unmarked_node = unsafe { Box::from_raw(w.as_ptr()) };
+                }
+
+                #[cfg(feature = "oscars_backend")]
+                {
+                    unsafe { std::ptr::drop_in_place(w.as_ptr() as *mut u8) };
+                    // NOTE: we cannot call free_slot here because we don't have
+                    // &mut pool_alloc (it's part of gc which is borrowed).
+                    // The slot will be reclaimed by drop_empty_pools.
+                }
 
                 false
             }
@@ -447,6 +518,7 @@ impl Collector {
         strong: &mut Vec<GcErasedPointer>,
         weak: &mut Vec<EphemeronPointer>,
         total_allocated: &mut usize,
+        #[cfg(feature = "oscars_backend")] pool_alloc: &mut PoolAllocator<'static>,
     ) {
         let _guard = DropGuard::new();
 
@@ -460,15 +532,19 @@ impl Collector {
                 true
             } else {
                 // SAFETY: The algorithm ensures only unmarked/unreachable pointers are dropped.
-                // The caller must ensure all pointers were allocated by `Box::into_raw(Box::new(..))`.
                 let drop_fn = node_ref.drop_fn();
                 let size = node_ref.size();
                 *total_allocated -= size;
 
-                // SAFETY: The function pointer is appropriate for this node type because we extract it from it's VTable.
+                // SAFETY: The function pointer is appropriate for this node type.
                 unsafe {
                     drop_fn(*node);
                 }
+
+                // With pool allocator: return the slot to the pool after drop_fn has
+                // destroyed the value in place (deallocation is separate from drop).
+                #[cfg(feature = "oscars_backend")]
+                pool_alloc.free_slot(node.cast::<u8>());
 
                 false
             }
@@ -484,15 +560,34 @@ impl Collector {
 
                 true
             } else {
-                // SAFETY: The algorithm ensures only unmarked/unreachable pointers are dropped.
-                // The caller must ensure all pointers were allocated by `Box::into_raw(Box::new(..))`.
-                let unmarked_eph = unsafe { Box::from_raw(eph.as_ptr()) };
-                let unallocated_bytes = size_of_val(&*unmarked_eph);
-                *total_allocated -= unallocated_bytes;
+                #[cfg(not(feature = "oscars_backend"))]
+                {
+                    // SAFETY: The algorithm ensures only unmarked/unreachable pointers are dropped.
+                    let unmarked_eph = unsafe { Box::from_raw(eph.as_ptr()) };
+                    let unallocated_bytes = size_of_val(&*unmarked_eph);
+                    *total_allocated -= unallocated_bytes;
+                }
+
+                #[cfg(feature = "oscars_backend")]
+                {
+                    let unallocated_bytes = unsafe { size_of_val(eph.as_ref()) };
+                    *total_allocated -= unallocated_bytes;
+                    // SAFETY: drop the value in place, then free the slot.
+                    unsafe {
+                        std::ptr::drop_in_place(eph.as_ptr() as *mut u8);
+                    }
+                    pool_alloc.free_slot(
+                        NonNull::new(eph.as_ptr().cast::<u8>()).expect("non-null ephemeron"),
+                    );
+                }
 
                 false
             }
         });
+
+        // With pool allocator: reclaim empty pools after sweep.
+        #[cfg(feature = "oscars_backend")]
+        pool_alloc.drop_empty_pools();
     }
 
     // Clean up the heap when BoaGc is dropped
@@ -500,33 +595,54 @@ impl Collector {
         // Weak maps have to be dropped first, since the process dereferences GcBoxes.
         // This can be done without initializing a dropguard since no GcBox's are being dropped.
         for node in mem::take(&mut gc.weak_maps) {
-            // SAFETY:
-            // The `Allocator` must always ensure its start node is a valid, non-null pointer that
-            // was allocated by `Box::from_raw(Box::new(..))`.
-            let _unmarked_node = unsafe { Box::from_raw(node.as_ptr()) };
+            #[cfg(not(feature = "oscars_backend"))]
+            {
+                // SAFETY: allocated by Box::into_raw(Box::new(..)).
+                let _unmarked_node = unsafe { Box::from_raw(node.as_ptr()) };
+            }
+
+            #[cfg(feature = "oscars_backend")]
+            {
+                unsafe { std::ptr::drop_in_place(node.as_ptr() as *mut u8) };
+                gc.pool_alloc.free_slot(
+                    NonNull::new(node.as_ptr().cast::<u8>()).expect("non-null weak map"),
+                );
+            }
         }
 
         // Not initializing a dropguard since this should only be invoked when BOA_GC is being dropped.
         let _guard = DropGuard::new();
 
         for node in mem::take(&mut gc.strongs) {
-            // SAFETY:
-            // The `Allocator` must always ensure its start node is a valid, non-null pointer that
-            // was allocated by `Box::from_raw(Box::new(..))`.
+            // SAFETY: drop_fn drops the value (and deallocates if not using pool alloc).
             let drop_fn = unsafe { node.as_ref() }.drop_fn();
-
-            // SAFETY: The function pointer is appropriate for this node type because we extract it from it's VTable.
             unsafe {
                 drop_fn(node);
             }
+
+            #[cfg(feature = "oscars_backend")]
+            gc.pool_alloc.free_slot(node.cast::<u8>());
         }
 
         for node in mem::take(&mut gc.weaks) {
-            // SAFETY:
-            // The `Allocator` must always ensure its start node is a valid, non-null pointer that
-            // was allocated by `Box::from_raw(Box::new(..))`.
-            let _unmarked_node = unsafe { Box::from_raw(node.as_ptr()) };
+            #[cfg(not(feature = "oscars_backend"))]
+            {
+                // SAFETY: allocated by Box::into_raw(Box::new(..)).
+                let _unmarked_node = unsafe { Box::from_raw(node.as_ptr()) };
+            }
+
+            #[cfg(feature = "oscars_backend")]
+            {
+                unsafe { std::ptr::drop_in_place(node.as_ptr() as *mut u8) };
+                gc.pool_alloc.free_slot(
+                    NonNull::new(node.as_ptr().cast::<u8>()).expect("non-null weak"),
+                );
+            }
         }
+
+        // With pool allocator: reclaim empty pools after cleanup.
+        #[cfg(feature = "oscars_backend")]
+        gc.pool_alloc.drop_empty_pools();
     }
 }
 

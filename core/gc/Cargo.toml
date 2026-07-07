@@ -11,6 +11,8 @@ repository.workspace = true
 rust-version.workspace = true
 
 [features]
+default = ["boa_gc_backend"]
+boa_gc_backend = []
 # Enable default implementations of trace and finalize for the thin-vec crate
 thin-vec = ["dep:thin-vec"]
 # Enable default implementations of trace and finalize for some `ICU4X` types
@@ -21,6 +23,8 @@ boa_string = ["dep:boa_string"]
 either = ["dep:either"]
 # Enable default implementations of trace and finalize for the arrayvec crate
 arrayvec = ["dep:arrayvec"]
+# Experimental: swap Box allocation with mempool3's PoolAllocator for benchmarking
+oscars_backend = ["dep:oscars"]
 
 [dependencies]
 boa_macros.workspace = true
@@ -31,6 +35,7 @@ either = { workspace = true, optional = true }
 thin-vec = { workspace = true, optional = true }
 icu_locale_core = { workspace = true, optional = true }
 arrayvec = { workspace = true, optional = true }
+oscars = { path = "../../../oscars/oscars", features = ["mark_sweep"], optional = true }
 
 [lints]
 workspace = true

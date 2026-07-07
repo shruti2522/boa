@@ -11,10 +11,15 @@ boa_runtime.workspace = true
 [dev-dependencies]
 criterion.workspace = true
 walkdir = "2"
+oscars = { path = "../../oscars/oscars", features = ["mark_sweep"] }
 
 [target.x86_64-unknown-linux-gnu.dev-dependencies]
 jemallocator.workspace = true
 
 [[bench]]
 name = "scripts"
+harness = false
+
+[[bench]]
+name = "gc_comparison"
 harness = false

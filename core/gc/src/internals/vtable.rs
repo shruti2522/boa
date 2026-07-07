@@ -39,8 +39,19 @@ pub(crate) const fn vtable_of<T: Trace + 'static>() -> &'static VTable {
             // SAFETY: The caller must ensure that the passed erased pointer is `GcBox<Self>`.
             let this = this.cast::<GcBox<Self>>();
 
-            // SAFETY: The caller must ensure the erased pointer is not dropped or deallocated.
-            let _value = unsafe { Box::from_raw(this.as_ptr()) };
+            // With pool allocator: only drop the value in place.
+            // Deallocation is handled by PoolAllocator::free_slot in the sweep phase.
+            #[cfg(feature = "oscars_backend")]
+            unsafe {
+                std::ptr::drop_in_place(this.as_ptr());
+            }
+
+            // Without pool allocator: Box::from_raw drops AND deallocates.
+            #[cfg(not(feature = "oscars_backend"))]
+            {
+                // SAFETY: The caller must ensure the erased pointer is not dropped or deallocated.
+                let _value = unsafe { Box::from_raw(this.as_ptr()) };
+            }
         }
     }
 
