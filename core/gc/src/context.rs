@@ -2,8 +2,9 @@
 use oscars::collectors::mark_sweep_branded::{Gc, MutationContext};
 
 #[cfg(feature = "oscars_backend")]
-#[derive(Debug, Clone, Copy)]
-pub struct GcContext;
+pub struct GcContext {
+    mc: MutationContext<'static, 'static>,
+}
 
 #[cfg(feature = "oscars_backend")]
 impl Default for GcContext {
@@ -13,29 +14,21 @@ impl Default for GcContext {
 }
 
 #[cfg(feature = "oscars_backend")]
-struct SyncWrapper(MutationContext<'static, 'static>);
-#[cfg(feature = "oscars_backend")]
-unsafe impl Sync for SyncWrapper {}
-#[cfg(feature = "oscars_backend")]
-unsafe impl Send for SyncWrapper {}
-
-#[cfg(feature = "oscars_backend")]
 impl GcContext {
     #[must_use]
     pub fn new() -> Self {
-        Self
+        Self {
+            mc: MutationContext::global(),
+        }
     }
 
     pub fn alloc<T: crate::Trace + crate::Finalize + 'static>(&self, value: T) -> Gc<'static, T> {
-        let mc = MutationContext::global();
-        Gc::new(&mc, value)
+        Gc::new(&self.mc, value)
     }
 
     #[must_use]
-    pub fn gc_collector(&self) -> &'static MutationContext<'static, 'static> {
-        static DUMMY: std::sync::LazyLock<SyncWrapper> =
-            std::sync::LazyLock::new(|| SyncWrapper(MutationContext::global()));
-        &DUMMY.0
+    pub fn gc_collector(&self) -> &MutationContext<'static, 'static> {
+        &self.mc
     }
 }
 

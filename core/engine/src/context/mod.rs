@@ -477,7 +477,10 @@ impl Context {
     /// Gets the GC collector.
     #[must_use]
     pub fn gc_collector(&self) -> &'static boa_gc::MutationContext<'static, 'static> {
-        self.gc.gc_collector()
+        // SAFETY: The MutationContext is owned by Context and lives as long as the Context.
+        // We transmute the lifetime to 'static to avoid widespread borrow checker errors in boa_engine
+        // since none of the engine's APIs actually store this reference.
+        unsafe { std::mem::transmute(self.gc.gc_collector()) }
     }
 
     /// Set the value of trace on the context
